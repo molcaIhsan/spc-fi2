@@ -12,7 +12,15 @@ WORKDIR /app
 # "ModuleNotFoundError: No module named 'kafka.vendor.six.moves'". Confirmed
 # by actually building and running this image; 3.0.11 (the project resumed
 # active releases) imports cleanly on 3.12 -- verified the same way.
-RUN pip install --no-cache-dir kafka-python==3.0.11 psycopg2-binary==2.9.9
+#
+# libsnappy-dev is required for python-snappy to build -- FI2.data's real
+# messages are Snappy-compressed (confirmed by actually running this against
+# the live topic: "UnsupportedCodecError: Libraries for snappy compression
+# codec not found" without it). kafka-python doesn't bundle codec support.
+RUN apt-get update && apt-get install -y --no-install-recommends libsnappy-dev gcc && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir kafka-python==3.0.11 psycopg2-binary==2.9.9 python-snappy==0.7.3
 
 COPY spc/ ./spc/
 COPY poc_consumer.py .
