@@ -19,10 +19,11 @@ jobs:
       - name: Install test dependencies
         run: pip install -r requirements-test.txt
         # Deliberately NOT requirements-dev.txt: that pulls in apache-flink,
-        # which has historically restricted supported Python versions (e.g.
-        # Flink 1.18.x doesn't support 3.12) -- detector.py/preprocessing.py
-        # are pure Python and the tests shouldn't be able to fail just
-        # because the Flink package failed to build on this runner.
+        # which has historically restricted supported Python versions per
+        # release (confirmed failing to build on Python 3.12 locally with an
+        # older pinned version) -- detector.py/preprocessing.py/models.py/
+        # message_parser.py are pure Python and the tests shouldn't be able
+        # to fail just because the Flink package failed to build on this runner.
 
       - name: Run tests
         run: python -m pytest spc/tests/ -v

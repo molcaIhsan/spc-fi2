@@ -1,11 +1,13 @@
-# Runtime dependencies. detector.py/preprocessing.py are pure Python (zero deps
-# by design, for a lean production repo) -- this is only for the Flink job.
+# Runtime dependencies. detector.py/preprocessing.py/models.py/message_parser.py
+# are pure Python (zero deps by design) -- these are for the Flink job + config loading.
 #
-# Pin to whatever your target Flink cluster's minor version actually is before
-# deploying -- PyFlink's client version must match the cluster's Flink version.
-# ALSO CHECK PYTHON VERSION COMPATIBILITY: PyFlink historically restricts
-# supported Python versions per release (e.g. 1.18.x does not support Python
-# 3.12 -- confirmed failing to build locally while developing this repo).
-# Check the PyFlink release notes for your pinned version before assuming any
-# Python version works.
-apache-flink==1.18.1
+# 1.20.1 confirmed as the real target cluster's version (ajinomoto-etl-flink's
+# docker/Dockerfile base image, checked directly) -- was wrongly guessed as
+# 1.17.1/1.18.1 earlier before that was confirmed. PyFlink's client version
+# must match the cluster's Flink version, or job submission fails.
+apache-flink==1.20.1
+
+# For loading spc_line_config at job-submission time (config.py::fetch_line_calibrations)
+# -- a plain Python DB connection, separate from the Java JDBC driver the Flink
+# JDBC sink itself uses to WRITE spc_readings (see Dockerfile).
+psycopg2-binary==2.9.9

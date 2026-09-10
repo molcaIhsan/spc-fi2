@@ -1,143 +1,236 @@
 """
-PyFlink streaming job: Kafka (raw weight readings) -> SPC sustained-breach
-detector -> Kafka (per-item state + alert events).
+SPC monitoring job -- standalone, no dependency on ajinomoto-etl-flink.
 
-REQUIRES VERIFICATION AGAINST YOUR ACTUAL FLINK CLUSTER VERSION before deploying
--- PyFlink's client version must match the cluster's Flink version, and
-state-descriptor/connector builder APIs have moved across minor versions.
-Check `pyflink.__version__` against your cluster before running.
+Consumes FI2.data from Kafka (own consumer group), filters to
+action_type == 'W' (total weight) for the 3 target machines (ANRITSU54-1 /
+YAMATO-1 / YAMATO-2 -- Lines 1/2/3's checkweighers), runs the sustained-breach
+k-of-n drift detector per machine, writes one row per reading to Postgres
+(ajinomoto_mes.spc_readings).
 
-Fill in KAFKA_BOOTSTRAP_SERVERS / SOURCE_TOPIC / SINK_TOPIC below (or set them
-as environment variables -- see the os.environ.get() defaults).
+IMPORTANT, NOT YET DONE: none of these 3 lines have a real Phase I baseline.
+config.LINE_CALIBRATIONS are placeholders (YAMATO-1/YAMATO-2 explicitly share
+ANRITSU54-1's numbers, per instruction -- ASSUMED, not independently
+confirmed). This job can run in a "collect data, don't act on the alarms yet"
+mode today.
+
+Run boundary: the raw message has no run_id. This job resets detector state
+on a SKU change per hwcode and synthesizes its own run_id
+("<hwcode>_<sku>_<first-seen-timestamp>") for grouping/audit.
+
+REQUIRES VERIFICATION AGAINST YOUR ACTUAL FLINK CLUSTER VERSION before
+deploying -- see Dockerfile.
 """
 
-import json
-import os
+import logging
+import sys
+from datetime import datetime, timezone
+from typing import Dict
 
-from pyflink.datastream import StreamExecutionEnvironment, RuntimeExecutionMode
+from pyflink.common import Row, WatermarkStrategy
+from pyflink.common.typeinfo import Types
+from pyflink.common import Time
+from pyflink.datastream import StreamExecutionEnvironment
 from pyflink.datastream.functions import KeyedProcessFunction
 from pyflink.datastream.state import ValueStateDescriptor, StateTtlConfig
-from pyflink.common import Types, Time
-from pyflink.datastream.connectors.kafka import KafkaSource, KafkaSink, KafkaOffsetsInitializer
+from pyflink.datastream.connectors.kafka import KafkaSource, KafkaOffsetsInitializer
 from pyflink.common.serialization import SimpleStringSchema
 
-from .config import Config
+from .config import AppConfig, DEFAULT_CONFIG, TARGET_HWCODES, LineCalibration, fetch_line_calibrations, get_line_for_hwcode
+from .message_parser import parse_message, ParsedMessage
 from .preprocessing import MultiPackNormalizer
 from .detector import DriftDetector
-
-KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "CHANGE_ME:9092")
-SOURCE_TOPIC = os.environ.get("SOURCE_TOPIC", "CHANGE_ME_raw_weight_readings")
-SINK_TOPIC = os.environ.get("SINK_TOPIC", "CHANGE_ME_spc_drift_events")
-CONSUMER_GROUP = os.environ.get("CONSUMER_GROUP", "spc-detector")
-
-_TTL_CONFIG = StateTtlConfig.new_builder(Time.hours(Config.STATE_TTL_HOURS)).build()
+from .sinks import PostgresSinkBuilder
 
 
-class MultiPackNormalizerFunction(KeyedProcessFunction):
-    """Keyed by run_id. Wraps preprocessing.MultiPackNormalizer, unmodified logic."""
-
-    def open(self, runtime_context):
-        desc = ValueStateDescriptor("normalizer", Types.PICKLED_BYTE_ARRAY())
-        desc.enable_time_to_live(_TTL_CONFIG)
-        self.state = runtime_context.get_state(desc)
-
-    def process_element(self, value, ctx):
-        record = json.loads(value)
-        normalizer = self.state.value() or MultiPackNormalizer()
-
-        result = normalizer.update(float(record["weight"]))
-        self.state.update(normalizer)
-
-        if result is None:
-            return  # first reading of the run, or an invalid/discarded delta
-        unit_weight, pack_count = result
-
-        out = dict(record)
-        out["unit_weight"] = unit_weight
-        out["pack_count"] = pack_count
-        yield json.dumps(out)
+def _to_utc_datetime(timestamp_ms: float) -> datetime:
+    return datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc)
 
 
-class DriftDetectorFunction(KeyedProcessFunction):
-    """Keyed by run_id. Wraps detector.DriftDetector, unmodified logic."""
+def filter_spc_weight_data(record: ParsedMessage) -> bool:
+    return (
+        record is not None
+        and record.action_type == "W"
+        and record.hwcode in TARGET_HWCODES
+    )
+
+
+class SpcDetectorFunction(KeyedProcessFunction):
+    """Keyed by hwcode. Resets on SKU change (see module docstring's run-
+    boundary note) rather than a true run_id, which the raw stream lacks.
+
+    Takes calibrations as a constructor arg (loaded once in main(), from
+    Postgres if reachable) rather than reading a module-level dict -- this
+    function gets pickled and shipped to TaskManager processes, which may not
+    share process state with wherever main() ran."""
+
+    def __init__(self, calibrations: Dict[str, LineCalibration], state_ttl_hours: int):
+        self.calibrations = calibrations
+        self.state_ttl_hours = state_ttl_hours
 
     def open(self, runtime_context):
+        ttl_config = StateTtlConfig.new_builder(Time.hours(self.state_ttl_hours)).build()
+
+        normalizer_desc = ValueStateDescriptor("normalizer", Types.PICKLED_BYTE_ARRAY())
+        normalizer_desc.enable_time_to_live(ttl_config)
+        self.normalizer_state = runtime_context.get_state(normalizer_desc)
+
         detector_desc = ValueStateDescriptor("detector", Types.PICKLED_BYTE_ARRAY())
-        detector_desc.enable_time_to_live(_TTL_CONFIG)
+        detector_desc.enable_time_to_live(ttl_config)
         self.detector_state = runtime_context.get_state(detector_desc)
 
-        prev_desc = ValueStateDescriptor("prev_sustained", Types.BOOLEAN())
-        prev_desc.enable_time_to_live(_TTL_CONFIG)
-        self.prev_sustained_state = runtime_context.get_state(prev_desc)
+        run_desc = ValueStateDescriptor("run_context", Types.PICKLED_BYTE_ARRAY())
+        run_desc.enable_time_to_live(ttl_config)
+        self.run_state = runtime_context.get_state(run_desc)  # (sku, run_id)
 
-    def process_element(self, value, ctx):
-        record = json.loads(value)
-        detector = self.detector_state.value() or DriftDetector()
+    def process_element(self, record: ParsedMessage, ctx):
+        hwcode = record.hwcode
+        calibration = self.calibrations[hwcode]
 
-        result = detector.update(record["unit_weight"])
+        run_context = self.run_state.value()
+        is_new_run = run_context is None or run_context[0] != record.sku_code
+        if is_new_run:
+            run_id = f"{hwcode}_{record.sku_code}_{int(record.timestamp)}"
+            self.run_state.update((record.sku_code, run_id))
+            normalizer = MultiPackNormalizer(calibration)
+            detector = DriftDetector(calibration)
+        else:
+            run_id = run_context[1]
+            normalizer = self.normalizer_state.value() or MultiPackNormalizer(calibration)
+            detector = self.detector_state.value() or DriftDetector(calibration)
+
+        norm_result = normalizer.update(record.value)
+        self.normalizer_state.update(normalizer)
+
+        if norm_result is None:
+            return  # first reading of this run, or an implausible delta -- discarded
+
+        raw_delta, unit_weight, pack_count = norm_result
+
+        result = detector.update(unit_weight)
         self.detector_state.update(detector)
 
-        prev_sustained = bool(self.prev_sustained_state.value())
-        is_onset_event = bool(result["sustained_drift"]) and not prev_sustained
-        self.prev_sustained_state.update(bool(result["sustained_drift"]))
-
-        out = {
-            "run_id": record.get("run_id"),
-            "hwcode": record.get("hwcode"),
-            "sku": record.get("sku"),
-            "timestamp": record.get("timestamp"),
-            "unit_weight": record["unit_weight"],
-            "pack_count": record.get("pack_count"),
+        yield {
+            "machine_name": hwcode,
+            "line": get_line_for_hwcode(hwcode),
+            "sku": record.sku_code,
+            "run_id": run_id,
+            "event_timestamp": _to_utc_datetime(record.timestamp),
+            "raw_data": record.value,
+            "raw_delta": raw_delta,
+            "unit_weight": unit_weight,
+            "pack_count": pack_count,
             "ewma": result["ewma"],
             "kalman": result["kalman"],
             "is_breach": result["is_breach"],
-            "sustained_drift": result["sustained_drift"],
-            "is_onset_event": is_onset_event,  # the actual alarm event -- False->True transition only
-            "k_threshold": Config.SUSTAINED_THRESHOLD,
-            "n_window": Config.SUSTAINED_WINDOW,
+            "label": result["label"],
+            "alarm": result["sustained_drift"],
+            "config_status": calibration.status,
         }
-        yield json.dumps(out)
 
 
-def build_job() -> StreamExecutionEnvironment:
+SPC_READING_FIELD_TYPES = [
+    Types.STRING(),   # machine_name
+    Types.STRING(),   # line
+    Types.STRING(),   # sku
+    Types.STRING(),   # run_id
+    Types.SQL_TIMESTAMP(),  # event_timestamp
+    Types.DOUBLE(),   # raw_data
+    Types.DOUBLE(),   # raw_delta
+    Types.DOUBLE(),   # unit_weight
+    Types.INT(),      # pack_count
+    Types.DOUBLE(),   # ewma
+    Types.DOUBLE(),   # kalman
+    Types.BOOLEAN(),  # is_breach
+    Types.STRING(),   # label
+    Types.BOOLEAN(),  # alarm
+    Types.STRING(),   # config_status
+]
+
+SPC_READINGS_INSERT_SQL = """
+    INSERT INTO ajinomoto_mes.spc_readings
+    (machine_name, line, sku, run_id, event_timestamp, raw_data, raw_delta,
+     unit_weight, pack_count, ewma, kalman, is_breach, label, alarm, config_status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+
+def _to_row(d: dict) -> Row:
+    return Row(
+        d["machine_name"], d["line"], d["sku"], d["run_id"], d["event_timestamp"],
+        d["raw_data"], d["raw_delta"], d["unit_weight"], d["pack_count"],
+        d["ewma"], d["kalman"], d["is_breach"], d["label"], d["alarm"],
+        d["config_status"],
+    )
+
+
+def build_job(config: AppConfig, calibrations: Dict[str, LineCalibration]) -> StreamExecutionEnvironment:
     env = StreamExecutionEnvironment.get_execution_environment()
-    env.set_runtime_mode(RuntimeExecutionMode.STREAMING)
+    env.get_checkpoint_config().set_checkpoint_interval(config.flink.checkpoint_interval)
 
     source = (
         KafkaSource.builder()
-        .set_bootstrap_servers(KAFKA_BOOTSTRAP_SERVERS)
-        .set_topics(SOURCE_TOPIC)
-        .set_group_id(CONSUMER_GROUP)
-        .set_starting_offsets(KafkaOffsetsInitializer.latest())
+        .set_bootstrap_servers(config.kafka.bootstrap_server)
+        .set_topics(config.kafka.topic)
+        .set_group_id(config.kafka.group_id)
+        .set_starting_offsets(KafkaOffsetsInitializer.earliest())
         .set_value_only_deserializer(SimpleStringSchema())
         .build()
     )
 
-    sink = (
-        KafkaSink.builder()
-        .set_bootstrap_servers(KAFKA_BOOTSTRAP_SERVERS)
-        .set_record_serializer(
-            KafkaSink.record_serializer_builder()
-            .set_topic(SINK_TOPIC)
-            .set_value_serialization_schema(SimpleStringSchema())
-            .build()
-        )
-        .build()
+    raw_stream = env.from_source(source, WatermarkStrategy.no_watermarks(), "Kafka FI2.data")
+
+    parsed = (
+        raw_stream.map(parse_message, output_type=Types.PICKLED_BYTE_ARRAY())
+        .name("Parse Kafka Message")
+        .filter(filter_spc_weight_data)
+        .name("Filter action_type=W, target hwcodes")
     )
 
-    raw_stream = env.from_source(source, watermark_strategy=None, source_name="raw-weight-readings")
-
-    normalized = raw_stream.key_by(lambda s: json.loads(s)["run_id"]).process(
-        MultiPackNormalizerFunction(), output_type=Types.STRING()
+    detected = (
+        parsed.key_by(lambda r: r.hwcode)
+        .process(SpcDetectorFunction(calibrations, config.flink.state_ttl_hours), output_type=Types.PICKLED_BYTE_ARRAY())
+        .name("SPC Sustained-Breach Detector")
+        .filter(lambda d: d is not None)
+        .map(_to_row, output_type=Types.ROW(SPC_READING_FIELD_TYPES))
+        .name("To Postgres Row")
     )
 
-    detected = normalized.key_by(lambda s: json.loads(s)["run_id"]).process(
-        DriftDetectorFunction(), output_type=Types.STRING()
-    )
+    sink_builder = PostgresSinkBuilder(config.postgres)
+    sink_builder.build_sink(detected, SPC_READINGS_INSERT_SQL, SPC_READING_FIELD_TYPES)
 
-    detected.sink_to(sink)
     return env
 
 
+def setup_logging(config: AppConfig):
+    logging.basicConfig(
+        stream=sys.stdout,
+        level=getattr(logging, config.log_level.upper()),
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
+
+def main():
+    config = DEFAULT_CONFIG
+    setup_logging(config)
+
+    if not config.postgres.username or not config.postgres.password:
+        logging.warning(
+            "SPC_PG_USERNAME/SPC_PG_PASSWORD not set -- Postgres sink will fail to "
+            "connect until these are provided via environment variables."
+        )
+
+    calibrations = fetch_line_calibrations(config.postgres)
+    for hwcode, cal in calibrations.items():
+        if cal.status != "arl_validated":
+            logging.warning(
+                "%s is running with status=%s -- alarm/label for this "
+                "machine are NOT validated, do not act on them yet.",
+                hwcode, cal.status,
+            )
+
+    env = build_job(config, calibrations)
+    env.execute("SPC Monitoring Job")
+
+
 if __name__ == "__main__":
-    build_job().execute("spc-sustained-breach-detector")
+    main()

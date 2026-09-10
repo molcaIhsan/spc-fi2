@@ -1,59 +1,74 @@
 # spc-fi2
 
-Lean, production-track SPC drift detector for the `ANRITSU64-2` checkweigher
-(`250 GR-RC` SKU). Runs the validated sustained-breach k-of-n detection logic
-as a PyFlink streaming job.
+Standalone SPC drift detector for 3 checkweighers: `ANRITSU54-1` (Line 1),
+`YAMATO-1` (Line 2), `YAMATO-2` (Line 3). Runs the validated sustained-breach
+k-of-n detection logic as a PyFlink streaming job, reading `FI2.data` from
+Kafka directly (own consumer group, independent of any other job on the
+cluster) and writing to Postgres (`ajinomoto_mes` schema).
 
-**This repo intentionally contains only the runtime detector** — multi-pack
-normalization, the EWMA+Kalman breach detector, and the Flink job. No ML
-classifiers, no ARL-calibration/research tooling, and no hopper feedback
-controller (EPC). All of that stays in the research repo, `alarm-fi2`, where
-every number here was derived and can be re-derived.
+**Independent repo, no dependency on ajinomoto-etl-flink** — an earlier
+iteration of this job lived as `src/spc/` inside that repo, reusing its
+`fi2` package for message parsing and machine-id mappings; that approach was
+dropped in favor of this fully standalone one (still present on that repo's
+`add-spc-monitoring` branch if ever needed again, just not being developed
+further).
 
 ## Provenance
 
-Every constant in `spc/config.py` traces back to `alarm-fi2/RESEARCH.md` (the
-experiment log) and `alarm-fi2/history_runs/arl_calibration_no_cusum/` (the
-actual grid-search artifacts). If a parameter needs to change, recalibrate it
-there first — don't hand-tune it here.
+Every parameter in `spc/config.py`/`sql/schema.sql` traces back to a separate
+research repo, `alarm-fi2` (`RESEARCH.md`, the experiment log, and
+`history_runs/arl_calibration_no_cusum/`) — but that research was done
+entirely on `ANRITSU64-2` (Line 8), **a different machine** from the three
+this job targets. Confirmed directly against the real machine registry in
+ajinomoto-etl-flink (`fi2/models/enums.py`'s `MachineId` enum) before this
+was built. None of the three target lines have their own Phase I baseline
+yet — see Status below.
 
 ## Status: provisional, not final
 
-- **`(k, n) = (9, 50)`** is the best candidate found against an *illustrative*
-  false-alarm budget, not a real one supplied by whoever owns the production
-  line. `RESEARCH.md`'s Action Plan items #1-2 are still open. Expect this to
-  change once that number exists — the alternative already on file if
-  zero-miss is prioritized over false-alarm rate is `(k, n) = (7, 50)` (see
-  the comment in `config.py`).
-- **Estimator is EWMA+Kalman**, not raw `unit_weight` — raw won an ablation in
-  `alarm-fi2` but only on a reduced grid (Action Plan #4 not yet run). Ship
-  the fully-validated combination; don't switch to raw until that grid exists.
-- **A real bug was caught and fixed while porting this**: an earlier version of
-  the detector (in `alarm-fi2/src/filters.py`) OR'd CUSUM into the breach
-  trigger. The actual grid search proved that collapses the false-alarm budget
-  (ARL0 6,324 → 360). This repo's `detector.py` computes CUSUM for visibility
-  but excludes it from `is_breach` — see the regression test in
-  `spc/tests/test_detector.py::test_cusum_exceeding_its_threshold_does_not_trigger_is_breach`
-  that guards against this regressing.
+- **`(k, n) = (9, 40)`** on all 3 machines — the best k=9 candidate found for
+  the *research* machine at window sizes 40 and 50 (near-identical
+  performance), not independently validated for these 3. `RESEARCH.md`'s
+  Action Plan items #1-2 (get a real false-alarm budget) are still open.
+- **`YAMATO-1` and `YAMATO-2` share `ANRITSU54-1`'s numbers** (target
+  90.0000, spec 87.0030/93.9960) — per instruction, but **assumed**, not
+  independently confirmed for either Yamato line specifically.
+- **Config is tunable via Postgres, not hardcoded**: `spc/config.py::fetch_line_calibrations()`
+  loads from `ajinomoto_mes.spc_line_config` at job-submission time — change
+  a parameter with `UPDATE`, no redeploy. Falls back (loudly) to hardcoded
+  defaults if Postgres isn't reachable.
+- **A real bug was caught and fixed while building this**: an earlier
+  version of the detector OR'd CUSUM into the breach trigger, which the
+  actual grid search (on the research machine) proved collapses the
+  false-alarm budget (ARL0 6,324 → 360). Excluded here, with a regression
+  test guarding against it recurring (`spc/tests/test_detector.py`).
 
 ## Layout
 
 ```
 spc/
-  config.py        # all calibrated constants, provenance comments
-  preprocessing.py  # streaming multi-pack normalization
-  detector.py       # the sustained-breach k-of-n detector
-  flink_job.py       # PyFlink job: Kafka -> normalize -> detect -> Kafka
-  tests/             # pytest -- run before every change
+  config.py          # calibration (LineCalibration), fetch_line_calibrations() from Postgres
+  models.py           # Label enum (LSL/LCL/Normal/UCL/USL) + classify()
+  message_parser.py    # raw Kafka message format: @#HWCODE#ACTION#QTY#QUALITY#TIMESTAMP#SKU_CODE#REASON#!
+  preprocessing.py      # streaming multi-pack normalization
+  detector.py            # sustained-breach k-of-n detector
+  flink_job.py            # Kafka -> filter -> detect -> Postgres
+  sinks/postgres_sink.py   # JDBC sink builder
+  tests/                    # pytest -- run before every change
+sql/schema.sql               # spc_line_config (tunable) + spc_readings (partitioned)
 ```
 
 ## Running tests
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements-dev.txt
+pip install -r requirements-test.txt
 python -m pytest spc/tests/ -v
 ```
+
+22 tests, all passing: multi-pack normalization, detector label/alarm
+transitions (including the CUSUM-exclusion regression test), message parsing
+against a real captured sample, and the hwcode→line mapping.
 
 ## Docker
 
@@ -61,34 +76,40 @@ python -m pytest spc/tests/ -v
 docker build -t spc-detector:latest .
 ```
 
-See the comment block at the bottom of `Dockerfile` for how to submit the job
-to a running Flink cluster from this image — you'll need to fill in your
-JobManager address and Kafka topic names.
+Base image `flink:1.20.1` — confirmed as the real target cluster's version
+(checked directly against ajinomoto-etl-flink's own Dockerfile). See the
+comment block at the bottom of `Dockerfile` for how to submit the job to a
+running cluster.
 
 ## Before deploying to a real cluster
 
 1. **Verify the PyFlink API surface against your actual Flink cluster's
-   version.** This targets the DataStream API as of Flink 1.18 — state
-   descriptor and Kafka connector builder APIs have moved across minor
-   versions. Don't trust the imports in `flink_job.py` blind; check
-   `pyflink.__version__` against your cluster.
-2. **Fill in real topic names** — `KAFKA_BOOTSTRAP_SERVERS`, `SOURCE_TOPIC`,
-   `SINK_TOPIC` in `flink_job.py` are environment-variable-overridable
-   placeholders (`CHANGE_ME:9092` etc.), built against the raw schema
-   `{date_bucket, hwcode, timestamp, id, run_id, sku, weight}` from
-   `alarm-fi2/dataset/weight_anritsu64-2.csv`. Confirm your real topic's
-   schema matches before wiring this up.
-3. **Get the real false-alarm budget** from whoever owns the production line,
-   then confirm or change `(k, n)` in `config.py` accordingly.
-4. **CI currently only builds the Docker image, it doesn't push anywhere** —
-   `.github/workflows/ci.yml` has a comment marking where to add a registry
-   push step once you have a container registry and production target picked.
+   version.** Targets the DataStream API as of Flink 1.20 — don't trust the
+   imports in `flink_job.py` blind.
+2. **JDBC connector + Postgres driver + Kafka connector JAR versions in
+   `Dockerfile` are unverified** against Maven Central (no network access
+   while writing this).
+3. **Confirm the Kafka broker addresses** — `12.234.248.167:9092`,
+   `10.234.226.41:9092` were given directly for this job, but at least two
+   other different addresses exist across the broader ajinomoto-etl-flink
+   repo (a stale default, an ENV override) — this repo's own history of
+   inconsistency means none of these should be trusted without confirming.
+4. **Postgres credentials** — `SPC_PG_USERNAME`/`SPC_PG_PASSWORD` env vars,
+   never hardcoded. No `.env`/secrets file exists in ajinomoto-etl-flink's
+   checkout either (confirmed) — these have to come from you directly.
+5. **`sql/schema.sql` not yet applied** to the real database — need
+   credentials first, then review before applying.
+6. **Confirm `YAMATO-1`/`YAMATO-2` really do share `ANRITSU54-1`'s
+   target/spec numbers** — currently an assumption from instruction, not
+   independently verified per line.
+7. **Real Phase I baseline + ARL grid search per line** — not done. This job
+   can run in "collect data, don't act on the alarms yet" mode today (that's
+   what `config_status` on every row is for).
 
-## What's explicitly not here yet
+## What's explicitly not here
 
-- The hopper feedback controller (EPC) — its gain (`g`) is uncalibrated, so it
-  isn't safe to wire to a real actuator. See `alarm-fi2/src/controller.py` and
-  `RESEARCH.md`'s Action Plan for the step test that has to happen first.
-- A raw-`unit_weight` detector variant — the ablation that found it promising
-  only ran a reduced grid; don't add it here until `alarm-fi2`'s Action Plan
-  #4 validates it across the full grid.
+- The hopper feedback controller (EPC) — needs a real gain (`g`)
+  measurement first, not built for any of these 3 machines.
+- A `raw`-estimator detector variant — an ablation on the research machine
+  found it promising, but only on a reduced grid; not validated for these
+  machines either.
