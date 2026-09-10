@@ -1,0 +1,33 @@
+# Lightweight PoC container -- no Flink, no Maven artifacts to resolve (that's
+# what broke the earlier Flink-based Dockerfile: a guessed JAR version that
+# turned out not to exist). Just Python + two pip packages, running
+# poc_consumer.py, which reuses the exact same tested detector/preprocessing/
+# message_parser/models modules unmodified.
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# kafka-python==2.0.2 (the long-standing pin most tutorials use) is broken on
+# Python 3.12 -- its vendored `six` fails with
+# "ModuleNotFoundError: No module named 'kafka.vendor.six.moves'". Confirmed
+# by actually building and running this image; 3.0.11 (the project resumed
+# active releases) imports cleanly on 3.12 -- verified the same way.
+RUN pip install --no-cache-dir kafka-python==3.0.11 psycopg2-binary==2.9.9
+
+COPY spc/ ./spc/
+COPY poc_consumer.py .
+
+# Credentials/config come from environment variables at `docker run` time --
+# see README.md / config.py. Nothing hardcoded, nothing baked into the image.
+CMD ["python", "poc_consumer.py"]
+
+# --------------------------------------------------------------------------
+# Build:
+#   docker build -f Dockerfile.poc -t spc-poc:latest .
+#
+# Run (fill in real Postgres credentials; Kafka bootstrap servers default to
+# the two brokers already confirmed reachable from this network):
+#   docker run --rm -it \
+#     -e SPC_PG_USERNAME=ajinomoto -e SPC_PG_PASSWORD=ajinomoto \
+#     spc-poc:latest
+# --------------------------------------------------------------------------
