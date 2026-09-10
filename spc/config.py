@@ -42,13 +42,17 @@ class KafkaConfig:
 
 @dataclass
 class PostgresConfig:
-    """jdbc:postgresql://16.78.150.84:5432/ajinomoto_mes, schema ajinomoto_mes.
+    """jdbc:postgresql://16.78.150.84:5432/ajinomoto_mes, schema 'spc'.
+    Database and schema are two different things that happened to share the
+    name "ajinomoto_mes" earlier -- the database really is named that, but
+    the schema our tables actually live in (confirmed by the user, and by
+    apply_schema.py's real run) is 'spc', not 'ajinomoto_mes'.
     No credentials given yet -- must come from env, never hardcoded/committed."""
 
     host: str = os.getenv("SPC_PG_HOST", "16.78.150.84")
     port: int = int(os.getenv("SPC_PG_PORT", "5432"))
     database: str = os.getenv("SPC_PG_DATABASE", "ajinomoto_mes")
-    schema: str = os.getenv("SPC_PG_SCHEMA", "ajinomoto_mes")
+    schema: str = os.getenv("SPC_PG_SCHEMA", "spc")
     username: str = os.getenv("SPC_PG_USERNAME", "")
     password: str = os.getenv("SPC_PG_PASSWORD", "")
 

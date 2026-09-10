@@ -5,7 +5,7 @@ machine every number in the separate `alarm-fi2`/`RESEARCH.md` research was
 validated on. Runs the validated sustained-breach k-of-n detection logic as
 a PyFlink streaming job, reading `FI2.data` from Kafka directly (own
 consumer group, independent of any other job on the cluster) and writing to
-Postgres (`ajinomoto_mes` schema).
+Postgres (`ajinomoto_mes` database, `spc` schema -- database and schema happen to have different names).
 
 **Independent repo, no dependency on ajinomoto-etl-flink** — an earlier
 iteration of this job lived as `src/spc/` inside that repo, reusing its
@@ -33,22 +33,38 @@ deferring the 3 production lines until their numbers are reconciled with
 whoever owns them. The hwcode→line mapping still knows about all 4 machines
 (`spc/config.py::get_line_for_hwcode`) — nothing was deleted, just deferred.
 
-## Status: mostly real now, one thing still open
+## Status: running for real, end-to-end, against live production data
 
+- **The PoC is live**: `poc_consumer.py` has been run against the real
+  `FI2.data` topic and the real `ajinomoto_mes` database, confirmed by both
+  its own log output and an independent `SELECT` against
+  `spc.spc_readings` — real `ANRITSU64-2` readings (all `label='Normal'`,
+  `alarm=False` so far, consistent with a genuinely in-control process).
 - **`(k, n) = (9, 50)`, control limits, spec limits — all real**, from
   `alarm-fi2/RESEARCH.md`'s actual Phase I calibration + ARL0/ARL1 grid
   search on `ANRITSU64-2`'s historical data. `spc_line_config.status =
   'arl_validated'` for this machine reflects that honestly.
 - **Config is tunable via Postgres, not hardcoded**: `fetch_line_calibrations()`
-  loads from `ajinomoto_mes.spc_line_config` at job-submission time — change
-  a parameter with `UPDATE`, no redeploy. Falls back (loudly) to hardcoded
+  loads from `spc.spc_line_config` at job-submission time — change a
+  parameter with `UPDATE`, no redeploy. Falls back (loudly) to hardcoded
   defaults if Postgres isn't reachable.
-- **A real bug was caught and fixed while building this**: an earlier
-  version of the detector OR'd CUSUM into the breach trigger, which the
-  actual grid search proved collapses the false-alarm budget (ARL0 6,324 →
-  360). Excluded here, with a regression test guarding against it recurring.
-- **Still open**: this job hasn't been run against the real Kafka topic yet
-  (only manually sampled via a console consumer) — see next section.
+- **Database vs. schema**: the database is `ajinomoto_mes`, but our tables
+  live in the `spc` schema inside it — two different things that happened
+  to share a name earlier in this project's history. `SPC_PG_SCHEMA`
+  overrides the schema if it's ever something else again.
+- **Real bugs caught and fixed while building/running this** (not just
+  written and assumed correct):
+  - An earlier version of the detector OR'd CUSUM into the breach trigger,
+    which the actual grid search proved collapses the false-alarm budget
+    (ARL0 6,324 → 360). Excluded, with a regression test.
+  - `kafka-python==2.0.2` (the version most tutorials pin) is broken on
+    Python 3.12 (`ModuleNotFoundError: kafka.vendor.six.moves`) — pinned
+    `3.0.11` instead.
+  - Real `FI2.data` messages are Snappy-compressed — needed `libsnappy-dev`
+    + `python-snappy` added to the image, not assumed unnecessary.
+  - `SPC_PG_SCHEMA` was only respected by the calibration *read* path;
+    `apply_schema.py`/`poc_consumer.py`'s *write* path silently ignored it
+    and always targeted `ajinomoto_mes` regardless. Fixed in both places.
 
 ## Kafka access — what we learned getting here
 

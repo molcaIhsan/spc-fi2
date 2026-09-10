@@ -1,8 +1,11 @@
--- SPC schema for ajinomoto_mes (jdbc:postgresql://16.78.150.84:5432/ajinomoto_mes)
+-- SPC schema 'spc' inside the ajinomoto_mes database
+-- (jdbc:postgresql://16.78.150.84:5432/ajinomoto_mes) -- database and schema
+-- are two different things that happened to share a name earlier; the
+-- database really is ajinomoto_mes, but our tables live in the 'spc' schema.
 --
--- NOT YET APPLIED to the live database -- for review first (need real
--- credentials to apply it; none found in this repo -- see README.md).
--- Matches exactly what spc/flink_job.py produces (SPC_READINGS_INSERT_SQL).
+-- Already applied to the real database (confirmed) -- this file is now the
+-- record of what's actually there, not just a proposal.
+-- Matches exactly what poc_consumer.py / spc/flink_job.py produce.
 --
 -- PoC SCOPE: ANRITSU64-2 (Line 8) only -- the real research machine from
 -- alarm-fi2/RESEARCH.md. The 3 production lines explored earlier
@@ -23,8 +26,8 @@
 --                      search on this machine's historical data.
 --   spc_readings    -- one row per processed reading. Partitioned by month.
 
-CREATE SCHEMA IF NOT EXISTS ajinomoto_mes;
-SET search_path TO ajinomoto_mes;
+CREATE SCHEMA IF NOT EXISTS spc;
+SET search_path TO spc;
 
 -- ---------------------------------------------------------------------------
 -- 1. spc_line_config -- one row per machine, tunable calibration + status.
