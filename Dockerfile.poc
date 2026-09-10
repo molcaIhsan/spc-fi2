@@ -23,7 +23,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends libsnappy-dev g
 RUN pip install --no-cache-dir kafka-python==3.0.11 psycopg2-binary==2.9.9 python-snappy==0.7.3
 
 COPY spc/ ./spc/
-COPY poc_consumer.py .
+COPY sql/ ./sql/
+COPY poc_consumer.py apply_schema.py .
 
 # Credentials/config come from environment variables at `docker run` time --
 # see README.md / config.py. Nothing hardcoded, nothing baked into the image.
