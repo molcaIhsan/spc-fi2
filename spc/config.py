@@ -1,11 +1,21 @@
 """
 SPC job configuration -- standalone, no dependency on ajinomoto-etl-flink/fi2.
 
-STATUS: 3 target machines, none with a real Phase I baseline (see
-LINE_CALIBRATIONS below). Config is tunable via Postgres (spc_line_config,
-sql/schema.sql) -- fetch_line_calibrations() loads it at job-submission time,
-so changing a parameter is an UPDATE statement, not a redeploy. Falls back
-(loudly) to the hardcoded defaults below if Postgres isn't reachable.
+STATUS: PoC scope is ANRITSU64-2 only (Line 8, FI2_8_C22) -- the actual
+research machine every number in the separate alarm-fi2/RESEARCH.md was
+validated on. The 3 real production lines (ANRITSU54-1/YAMATO-1/YAMATO-2)
+are deliberately deferred for now: live sampling from FI2.data found their
+real per-item weight (~1085-1094 raw units) is ~12x the placeholder
+target_weight=90.0000 we'd been using, and YAMATO-1/YAMATO-2 were observed
+running different SKUs at the same time (sku_code 2 vs 10) -- config needs
+to be reconciled per (hwcode, sku) with whoever owns those numbers before
+that's worth building further. ANRITSU64-2 has no such open question, so
+it's the PoC target.
+
+Config is tunable via Postgres (spc_line_config, sql/schema.sql) --
+fetch_line_calibrations() loads it at job-submission time, so changing a
+parameter is an UPDATE statement, not a redeploy. Falls back (loudly) to
+the hardcoded defaults below if Postgres isn't reachable.
 """
 
 import os
@@ -15,11 +25,16 @@ from typing import Dict, Optional
 
 @dataclass
 class KafkaConfig:
-    # Three different bootstrap-server values have shown up across the
-    # broader ajinomoto-etl-flink repo (stale defaults, an ENV override) --
-    # these two were given directly for this job. CONFIRM before deploying.
+    # Confirmed directly (kafkacat -L metadata, and cross-checked against a
+    # Kafka broker-overview dashboard): broker 1 is 10.234.248.167 -- the
+    # "12.234.248.167" given earlier was a typo (12 vs 10 in the first
+    # octet), which is why it looked unreachable. Both brokers are Kafka
+    # 4.3.0 (KRaft). FI2.data's only partition is led by broker 2
+    # (10.234.226.41) -- broker 1 isn't actually required to consume this
+    # specific topic, but both are listed since a client should still know
+    # the full cluster for metadata/failover.
     bootstrap_server: str = os.getenv(
-        "SPC_KAFKA_BOOTSTRAP_SERVERS", "12.234.248.167:9092,10.234.226.41:9092"
+        "SPC_KAFKA_BOOTSTRAP_SERVERS", "10.234.248.167:9092,10.234.226.41:9092"
     )
     topic: str = "FI2.data"
     group_id: str = os.getenv("SPC_KAFKA_GROUP_ID", "spc_monitoring")
@@ -50,15 +65,7 @@ class FlinkConfig:
 
 @dataclass
 class LineCalibration:
-    """One machine's SPC parameters. STATUS TRACKS WHETHER THIS IS REAL.
-
-    None of the three target lines have a Phase I baseline yet -- confirmed
-    directly against the ajinomoto-etl-flink repo's MachineId enum:
-    ANRITSU64-2 (the only machine with real calibration, in the separate
-    alarm-fi2/RESEARCH.md research) is FI2_8_C22 on Line 8, not one of these
-    three. Every value below is a placeholder until real baseline data is
-    collected and calibrated per machine.
-    """
+    """One machine's SPC parameters. STATUS TRACKS WHETHER THIS IS REAL."""
 
     target_weight: float
     spec_lower: float
@@ -68,10 +75,9 @@ class LineCalibration:
     ewma_lambda: float = 0.20
     kalman_q: float = 0.05
     kalman_r: float = 4.0
-    sustained_threshold: int = 9   # k -- provisional, tunable via spc_line_config
-    sustained_window: int = 40     # n -- provisional (9-of-40 was a validated grid candidate in the
-                                    # separate alarm-fi2 research: ARL0~5257, miss 1.7%, delay ~417-419 items --
-                                    # for ANRITSU64-2, NOT for these 3 machines)
+    sustained_threshold: int = 9   # k -- RESEARCH.md's primary recommendation for ANRITSU64-2
+    sustained_window: int = 50     # n -- ditto (ARL0~5,159, miss 1.7%, delay ~416-419 items;
+                                    # 9-of-40 is a near-identical alternative also validated there)
     valid_weight_min: float = 0.0
     valid_weight_max: float = 0.0
     multi_pack_rules: tuple = ()   # ((min, max, divisor), ...)
@@ -81,7 +87,11 @@ class LineCalibration:
 # hwcode -> line, self-contained (previously derived from ajinomoto-etl-flink's
 # MachineId enum; hardcoded here since this repo no longer imports that repo).
 # Re-verify against that enum if it ever changes.
+# ANRITSU64-2 = FI2_8_C22 -> Line 8. The 3 production lines explored earlier
+# (ANRITSU54-1/YAMATO-1/YAMATO-2 -> Lines 1/2/3) are deferred -- see module
+# docstring -- but kept here since the mapping itself is still true.
 _HWCODE_TO_LINE = {
+    "ANRITSU64-2": "8",
     "ANRITSU54-1": "1",
     "YAMATO-1": "2",
     "YAMATO-2": "3",
@@ -96,23 +106,22 @@ def get_line_for_hwcode(hwcode: str) -> Optional[str]:
 # without a DB). The real, tunable source of truth is the spc_line_config
 # table (sql/schema.sql) -- change a parameter there via UPDATE, no redeploy.
 #
-# YAMATO-1/YAMATO-2 share ANRITSU54-1's numbers here, per instruction
-# ("yamato 1 and 2 use the same config for weight") -- ASSUMED, not
-# independently confirmed for either Yamato line specifically.
-_ANRITSU54_1_FALLBACK = LineCalibration(
-    target_weight=90.0000,
-    spec_lower=87.0030,
-    spec_upper=93.9960,
-    control_lower=88.5,   # PLACEHOLDER -- not a Phase I calibration, just inside spec as a stopgap
-    control_upper=91.5,   # PLACEHOLDER
-    valid_weight_min=60.0,
-    valid_weight_max=120.0,
-    status="uncalibrated_default",
+# These ARE the real, validated numbers from alarm-fi2/RESEARCH.md's Phase I
+# calibration + ARL grid search on ANRITSU64-2's actual historical data --
+# not a placeholder, unlike the 3 production lines this repo targeted earlier.
+_ANRITSU64_2_CALIBRATION = LineCalibration(
+    target_weight=250.0,
+    spec_lower=247.0,
+    spec_upper=253.0,
+    control_lower=248.8193900839789,   # Phase I 3-sigma, confirmed-clean baseline runs only
+    control_upper=251.1806099160211,
+    valid_weight_min=200.0,
+    valid_weight_max=300.0,
+    multi_pack_rules=((450.0, 550.0, 2.0), (700.0, 800.0, 3.0), (950.0, 1050.0, 4.0)),
+    status="arl_validated",
 )
 LINE_CALIBRATIONS: Dict[str, LineCalibration] = {
-    "ANRITSU54-1": _ANRITSU54_1_FALLBACK,
-    "YAMATO-1": _ANRITSU54_1_FALLBACK,
-    "YAMATO-2": _ANRITSU54_1_FALLBACK,
+    "ANRITSU64-2": _ANRITSU64_2_CALIBRATION,
 }
 
 TARGET_HWCODES = frozenset(LINE_CALIBRATIONS.keys())

@@ -23,7 +23,12 @@ def test_classify_spec_takes_priority_over_control():
     assert classify(95.0, 87.0, 94.0, False, True) == Label.USL
 
 
-def test_line_mapping_matches_the_three_target_machines():
+def test_line_mapping_matches_the_poc_machine():
+    assert get_line_for_hwcode("ANRITSU64-2") == "8"
+
+
+def test_line_mapping_still_knows_the_deferred_production_lines():
+    # Deferred, not deleted -- see config.py module docstring.
     assert get_line_for_hwcode("ANRITSU54-1") == "1"
     assert get_line_for_hwcode("YAMATO-1") == "2"
     assert get_line_for_hwcode("YAMATO-2") == "3"

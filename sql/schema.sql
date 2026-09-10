@@ -4,16 +4,23 @@
 -- credentials to apply it; none found in this repo -- see README.md).
 -- Matches exactly what spc/flink_job.py produces (SPC_READINGS_INSERT_SQL).
 --
+-- PoC SCOPE: ANRITSU64-2 (Line 8) only -- the real research machine from
+-- alarm-fi2/RESEARCH.md. The 3 production lines explored earlier
+-- (ANRITSU54-1/YAMATO-1/YAMATO-2) are deferred: live sampling from FI2.data
+-- found their real per-item weight (~1085-1094 raw units) is ~12x the
+-- placeholder target_weight=90.0000 previously seeded here, and YAMATO-1/
+-- YAMATO-2 were observed running different SKUs simultaneously (sku_code 2
+-- vs 10) -- needs reconciling with whoever owns those numbers before it's
+-- worth re-adding.
+--
 -- Two tables:
 --   spc_line_config -- one row per machine. The tunable source of truth
 --                      (spc/config.py::fetch_line_calibrations reads this at
 --                      job-submission time) -- change a parameter here via
---                      UPDATE, no redeploy needed. Also the honest record of
---                      "is this line even calibrated yet": NONE of
---                      ANRITSU54-1/YAMATO-1/YAMATO-2 have a real Phase I
---                      baseline yet (ANRITSU64-2, the only machine with real
---                      calibration in the separate alarm-fi2 research, is a
---                      different machine -- Line 8, not one of these three).
+--                      UPDATE, no redeploy needed. status='arl_validated' for
+--                      ANRITSU64-2 is real, not a placeholder -- it reflects
+--                      alarm-fi2/RESEARCH.md's actual Phase I + ARL grid
+--                      search on this machine's historical data.
 --   spc_readings    -- one row per processed reading. Partitioned by month.
 
 CREATE SCHEMA IF NOT EXISTS ajinomoto_mes;
@@ -38,7 +45,7 @@ CREATE TABLE spc_line_config (
     kalman_r            NUMERIC(10,6) DEFAULT 4.0,
 
     sustained_threshold INTEGER DEFAULT 9,    -- k -- tunable: UPDATE this row, no redeploy needed
-    sustained_window    INTEGER DEFAULT 40,   -- n -- ditto
+    sustained_window    INTEGER DEFAULT 50,   -- n -- ditto
 
     valid_weight_min    NUMERIC(10,4),
     valid_weight_max    NUMERIC(10,4),
@@ -50,15 +57,13 @@ CREATE TABLE spc_line_config (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- YAMATO-1 and YAMATO-2 deliberately seeded with the SAME numbers as
--- ANRITSU54-1 (per instruction: "yamato 1 and 2 use the same config for
--- weight") -- NOT independently confirmed for either Yamato line
--- specifically. Two separate rows (Postgres has no "shared row" concept),
--- kept in sync by convention -- if you change one, change the other.
-INSERT INTO spc_line_config (machine_name, line, target_weight, spec_lower, spec_upper, control_lower, control_upper, valid_weight_min, valid_weight_max, status, status_reason) VALUES
-    ('ANRITSU54-1', '1', 90.0000, 87.0030, 93.9960, 88.5, 91.5, 60.0, 120.0, 'uncalibrated_default', 'target/spec given directly; control_lower/upper are a placeholder inside spec, not a Phase I calibration'),
-    ('YAMATO-1',    '2', 90.0000, 87.0030, 93.9960, 88.5, 91.5, 60.0, 120.0, 'uncalibrated_default', 'ASSUMED same as ANRITSU54-1 per instruction -- not independently confirmed for this line'),
-    ('YAMATO-2',    '3', 90.0000, 87.0030, 93.9960, 88.5, 91.5, 60.0, 120.0, 'uncalibrated_default', 'ASSUMED same as ANRITSU54-1 per instruction -- not independently confirmed for this line')
+-- Real, validated calibration -- alarm-fi2/RESEARCH.md's Phase I 3-sigma +
+-- ARL0/ARL1 grid search on ANRITSU64-2's actual historical data (not a
+-- placeholder, unlike everything seeded here previously).
+INSERT INTO spc_line_config (machine_name, line, target_weight, spec_lower, spec_upper, control_lower, control_upper, sustained_threshold, sustained_window, valid_weight_min, valid_weight_max, multi_pack_rules, status, status_reason) VALUES
+    ('ANRITSU64-2', '8', 250.0, 247.0, 253.0, 248.8193900839789, 251.1806099160211, 9, 50, 200.0, 300.0,
+     '[{"min":450.0,"max":550.0,"divisor":2.0},{"min":700.0,"max":800.0,"divisor":3.0},{"min":950.0,"max":1050.0,"divisor":4.0}]',
+     'arl_validated', 'Phase I baseline + full ARL0/ARL1 grid search, alarm-fi2/RESEARCH.md §4.4')
 ON CONFLICT (machine_name) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
