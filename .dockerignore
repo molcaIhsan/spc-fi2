@@ -1,0 +1,8 @@
+.venv/
+.git/
+.github/
+spc/tests/
+__pycache__/
+*.pyc
+.pytest_cache/
+README.md

@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: pip install -r requirements-test.txt
+        # Deliberately NOT requirements-dev.txt: that pulls in apache-flink,
+        # which has historically restricted supported Python versions (e.g.
+        # Flink 1.18.x doesn't support 3.12) -- detector.py/preprocessing.py
+        # are pure Python and the tests shouldn't be able to fail just
+        # because the Flink package failed to build on this runner.
+
+      - name: Run tests
+        run: python -m pytest spc/tests/ -v
+
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image (no push -- confirms the Dockerfile still builds)
+        run: docker build -t spc-detector:ci .
+
+    # No push/registry step yet -- add one (docker/login-action +
+    # docker/build-push-action, or your registry's equivalent) once you have
+    # a container registry and a production target to push to. This job is
+    # intentionally build-only until that's decided.

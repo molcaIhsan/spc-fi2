@@ -1,0 +1,11 @@
+# Runtime dependencies. detector.py/preprocessing.py are pure Python (zero deps
+# by design, for a lean production repo) -- this is only for the Flink job.
+#
+# Pin to whatever your target Flink cluster's minor version actually is before
+# deploying -- PyFlink's client version must match the cluster's Flink version.
+# ALSO CHECK PYTHON VERSION COMPATIBILITY: PyFlink historically restricts
+# supported Python versions per release (e.g. 1.18.x does not support Python
+# 3.12 -- confirmed failing to build locally while developing this repo).
+# Check the PyFlink release notes for your pinned version before assuming any
+# Python version works.
+apache-flink==1.18.1

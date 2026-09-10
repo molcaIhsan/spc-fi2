@@ -1,0 +1,7 @@
+# Deps for running spc/tests/ only. Deliberately does NOT pull in
+# requirements.txt (apache-flink) -- detector.py and preprocessing.py are pure
+# Python with zero runtime dependencies, and apache-flink has historically
+# restricted supported Python versions (e.g. Flink 1.18.x doesn't support
+# Python 3.12) -- CI's test job shouldn't be able to fail just because the
+# Flink package failed to build on some runner's Python version.
+pytest==8.3.3
