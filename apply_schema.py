@@ -24,6 +24,19 @@ def main():
     schema_path = Path(__file__).parent / "sql" / "schema.sql"
     sql_text = schema_path.read_text()
 
+    # schema.sql hardcodes "ajinomoto_mes" for CREATE SCHEMA/SET search_path --
+    # fine as the readable default, but if SPC_PG_SCHEMA points somewhere else,
+    # the actual DDL has to follow it, not silently keep creating tables in
+    # ajinomoto_mes regardless. Only the two functional lines are touched, not
+    # the file's comments, so schema.sql itself stays readable as documentation.
+    if pg.schema != "ajinomoto_mes":
+        sql_text = sql_text.replace(
+            "CREATE SCHEMA IF NOT EXISTS ajinomoto_mes;", f"CREATE SCHEMA IF NOT EXISTS {pg.schema};"
+        ).replace(
+            "SET search_path TO ajinomoto_mes;", f"SET search_path TO {pg.schema};"
+        )
+        print(f"Applying to schema '{pg.schema}' (SPC_PG_SCHEMA override, not the default ajinomoto_mes)")
+
     conn = psycopg2.connect(
         host=pg.host, port=pg.port, dbname=pg.database,
         user=pg.username, password=pg.password,

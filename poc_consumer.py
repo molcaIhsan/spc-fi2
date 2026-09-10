@@ -27,16 +27,22 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
-INSERT_SQL = """
-    INSERT INTO ajinomoto_mes.spc_readings
-    (machine_name, line, sku, run_id, event_timestamp, raw_data, raw_delta,
-     unit_weight, pack_count, ewma, kalman, is_breach, label, alarm, config_status)
-    VALUES (%s, %s, %s, %s, to_timestamp(%s), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-"""
+def _build_insert_sql(schema: str) -> str:
+    # Schema name has to come from config, not be hardcoded here -- was
+    # literally "ajinomoto_mes" regardless of SPC_PG_SCHEMA until this fix,
+    # meaning writes silently ignored any override, unlike the calibration
+    # read path (fetch_line_calibrations), which already used it correctly.
+    return f"""
+        INSERT INTO {schema}.spc_readings
+        (machine_name, line, sku, run_id, event_timestamp, raw_data, raw_delta,
+         unit_weight, pack_count, ewma, kalman, is_breach, label, alarm, config_status)
+        VALUES (%s, %s, %s, %s, to_timestamp(%s), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
 
 
 def main():
     config = DEFAULT_CONFIG
+    insert_sql = _build_insert_sql(config.postgres.schema)
 
     if not config.postgres.username or not config.postgres.password:
         logging.error(
@@ -104,7 +110,7 @@ def main():
         result = detector.update(unit_weight)
 
         with pg_conn.cursor() as cur:
-            cur.execute(INSERT_SQL, (
+            cur.execute(insert_sql, (
                 record.hwcode, get_line_for_hwcode(record.hwcode), record.sku_code, run_id,
                 record.timestamp / 1000.0, record.value, raw_delta, unit_weight, pack_count,
                 result["ewma"], result["kalman"], result["is_breach"], result["label"],
